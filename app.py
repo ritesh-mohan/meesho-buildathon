@@ -1,9 +1,9 @@
 import json
 import re
-from urllib.parse import quote
 
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # Config
@@ -37,6 +37,17 @@ FALLBACK_FREE_MODELS = [
     {"id": "meta-llama/llama-3.3-70b-instruct:free", "name": "Llama 3.3 70B Instruct", "context": 131072},
     {"id": "openai/gpt-oss-120b:free", "name": "GPT-OSS 120B", "context": 131072},
     {"id": "google/gemma-3-27b-it:free", "name": "Gemma 3 27B", "context": 96000},
+]
+
+# Plain instruction-following models tend to be far more reliable for this task than
+# "reasoning" models, which can burn their whole token budget on hidden thinking and
+# leave nothing for the actual answer (showing up as "..." or empty descriptions).
+# These get bumped to the top of the dropdown when they're available.
+PREFERRED_MODEL_IDS = [
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "mistralai/mistral-small-3.2-24b-instruct:free",
+    "qwen/qwen-2.5-72b-instruct:free",
 ]
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
@@ -78,7 +89,16 @@ def fetch_free_models():
                 })
         if not free:
             return FALLBACK_FREE_MODELS
-        free.sort(key=lambda m: (-m["context"], m["name"]))
+
+        def sort_key(m):
+            preferred_rank = (
+                PREFERRED_MODEL_IDS.index(m["id"])
+                if m["id"] in PREFERRED_MODEL_IDS
+                else len(PREFERRED_MODEL_IDS)
+            )
+            return (preferred_rank, -m["context"], m["name"])
+
+        free.sort(key=sort_key)
         return free
     except Exception:
         return FALLBACK_FREE_MODELS
@@ -221,7 +241,8 @@ Rules:
 - Each description: 2-4 short sentences, warm and persuasive, suitable for a WhatsApp broadcast or Instagram caption. Include 2-3 relevant emojis placed naturally. Mention the strongest selling points from the details given. End with a short, natural call-to-action (e.g. order now / DM to order / limited stock), phrased naturally in that language.
 - Keep each description under 55 words.
 - Do not invent facts (like price, materials, or delivery time) that were not given to you.
-- Keep the core message consistent across languages, but let phrasing and tone feel natural and local to each language rather than a stiff literal translation."""
+- Keep the core message consistent across languages, but let phrasing and tone feel natural and local to each language rather than a stiff literal translation.
+- CRITICAL: every value must be the full, real description written out in complete words. Never use "...", "etc.", "(same as above)", or any other placeholder or shortcut in place of actual text, even if several languages end up saying something similar. Write every single one out in full, no exceptions."""
 
 
 def build_user_prompt(product_name, category, price, details, langs):
@@ -247,6 +268,20 @@ def parse_json_loosely(text):
     return json.loads(cleaned)
 
 
+def is_low_quality(text):
+    """Flags placeholder-ish junk like '...', empty strings, or suspiciously short output —
+    a common failure mode on weaker free models (especially reasoning models that burn
+    their token budget on hidden thinking and leave nothing for the real answer)."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    if re.fullmatch(r"[.\u2026\s]+", t):
+        return True
+    if len(t) < 15:
+        return True
+    return False
+
+
 class AuthError(Exception):
     pass
 
@@ -255,28 +290,53 @@ class RateLimitError(Exception):
     pass
 
 
-def call_openrouter(api_key, model, product_name, category, price, details, langs):
-    user_prompt = build_user_prompt(product_name, category, price, details, langs)
+class LowQualityOutput(Exception):
+    pass
 
-    response = requests.post(
+
+def _post_to_openrouter(api_key, model, system_prompt, user_prompt, disable_reasoning):
+    payload = {
+        "model": model,
+        "max_tokens": 4096,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    if disable_reasoning:
+        # Prevents "thinking" models from spending their whole token budget on hidden
+        # reasoning and leaving nothing for the actual answer. Some models reject this
+        # outright (reasoning mandatory) — the caller retries without it in that case.
+        payload["reasoning"] = {"enabled": False}
+
+    return requests.post(
         OPENROUTER_URL,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
-            # Optional but recommended by OpenRouter for their leaderboards/rate-limit tiers.
             "HTTP-Referer": "https://bazaarbhasha.streamlit.app",
             "X-Title": "BazaarBhasha",
         },
-        json={
-            "model": model,
-            "max_tokens": 3000,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-        },
+        json=payload,
         timeout=60,
     )
+
+
+def call_openrouter(api_key, model, product_name, category, price, details, langs):
+    user_prompt = build_user_prompt(product_name, category, price, details, langs)
+
+    response = _post_to_openrouter(api_key, model, SYSTEM_PROMPT, user_prompt, disable_reasoning=True)
+
+    if response.status_code == 400:
+        # Some models require reasoning to always be on and reject the disable flag —
+        # retry once without it rather than failing outright.
+        detail = ""
+        try:
+            detail = response.json().get("error", {}).get("message", "")
+        except Exception:
+            pass
+        if "reasoning" in detail.lower():
+            response = _post_to_openrouter(api_key, model, SYSTEM_PROMPT, user_prompt, disable_reasoning=False)
 
     if not response.ok:
         detail = ""
@@ -294,8 +354,27 @@ def call_openrouter(api_key, model, product_name, category, price, details, lang
     choices = data.get("choices") or []
     if not choices:
         raise ValueError("No response returned by the model.")
-    text = choices[0]["message"]["content"]
-    return parse_json_loosely(text)
+
+    message = choices[0]["message"]
+    text = message.get("content") or ""
+    finish_reason = choices[0].get("finish_reason", "")
+
+    descriptions = parse_json_loosely(text)
+
+    bad_langs = [l["name"] for l in langs if is_low_quality(descriptions.get(l["code"]))]
+    if bad_langs:
+        reason = (
+            " The model likely ran out of its token budget on hidden reasoning before writing "
+            "the real answer."
+            if finish_reason == "length"
+            else " This model may be too weak for this task, or briefly had an off response."
+        )
+        raise LowQualityOutput(
+            f"The model returned placeholder/empty text for: {', '.join(bad_langs)}.{reason} "
+            "Try a different model from the sidebar, or generate fewer languages at once."
+        )
+
+    return descriptions
 
 
 # ---------------------------------------------------------------------------
@@ -325,10 +404,48 @@ if submitted:
                 st.error(str(e))
             except RateLimitError as e:
                 st.error(str(e))
+            except LowQualityOutput as e:
+                st.error(str(e))
             except json.JSONDecodeError:
-                st.error("Could not parse the model's response. Please try again.")
+                st.error("Could not parse the model's response. Please try again, or pick a different model.")
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
+
+def copy_button(text, key, accent):
+    """A small self-contained copy-to-clipboard button, since Streamlit's native
+    button can't reach the browser clipboard on its own."""
+    safe_text = json.dumps(text)  # safely escaped for embedding as a JS string literal
+    components.html(
+        f"""
+        <div style="font-family:'Noto Sans',sans-serif;">
+          <button id="copy-btn-{key}" style="
+              width:100%; padding:9px 10px; border-radius:9px; font-size:13px; cursor:pointer;
+              background:#241B40; color:#F5F2FF; border:1px solid rgba(255,255,255,0.15);
+              transition: background 0.15s, border-color 0.15s;">
+            📋 Copy
+          </button>
+        </div>
+        <script>
+          const btn = document.getElementById('copy-btn-{key}');
+          btn.addEventListener('click', () => {{
+            navigator.clipboard.writeText({safe_text}).then(() => {{
+              btn.innerText = '✅ Copied';
+              btn.style.background = 'rgba(63,167,107,0.18)';
+              btn.style.borderColor = '#3FA76B';
+              setTimeout(() => {{
+                btn.innerText = '📋 Copy';
+                btn.style.background = '#241B40';
+                btn.style.borderColor = 'rgba(255,255,255,0.15)';
+              }}, 1500);
+            }});
+          }});
+          btn.addEventListener('mouseover', () => {{ btn.style.borderColor = '{accent}'; }});
+          btn.addEventListener('mouseout', () => {{ btn.style.borderColor = 'rgba(255,255,255,0.15)'; }});
+        </script>
+        """,
+        height=44,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Results
@@ -346,9 +463,11 @@ if "results" in st.session_state:
             f'<span class="tag-lang-native">{lang["native"]}</span></div>',
             unsafe_allow_html=True,
         )
-        st.code(text, language=None)
-        wa_url = f"https://wa.me/?text={quote(text)}"
-        st.link_button("💬 Share on WhatsApp", wa_url)
+        if is_low_quality(text):
+            st.warning(f"Got an empty/placeholder response for {lang['name']}. Try regenerating.")
+        else:
+            st.code(text, language=None)
+            copy_button(text, key=lang["code"], accent=lang["accent"])
         st.divider()
 
 st.caption(
