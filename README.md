@@ -1,8 +1,8 @@
-# BazaarBhasha 🛍️🗣️ — Streamlit version (via OpenRouter)
+# BazaarBhasha 🛍️🗣️ — Streamlit version (free models via OpenRouter)
 
 **Type your product details once. Get catchy, ready-to-post descriptions in 11 Indian languages — for WhatsApp, Instagram, and your storefront.**
 
-This build calls Claude through **[OpenRouter](https://openrouter.ai)** rather than Anthropic's API directly — useful if OpenRouter is where your credits/key already live. Since Streamlit has a real Python backend, **you** (the person deploying it) set one OpenRouter API key as a secret, and anyone who opens the app can use it — no one else needs their own key.
+This build calls **free, $0-per-token models on [OpenRouter](https://openrouter.ai)** — no Anthropic billing, no OpenRouter credit required. The model dropdown is populated **live** from OpenRouter's model catalog (filtered to models priced at zero), since the free-tier lineup rotates fairly often. Since Streamlit has a real Python backend, **you** (the person deploying it) set one OpenRouter API key as a secret, and anyone who opens the app can use it — no one else needs their own key.
 
 ## Files
 
@@ -27,7 +27,7 @@ streamlit run app.py
 
 It'll open at `http://localhost:8501`. Test it end-to-end (generate a real description) before you deploy.
 
-Get a key at [openrouter.ai/keys](https://openrouter.ai/keys) — it starts with `sk-or-`. Add credit to your OpenRouter account under **Settings → Credits** if you haven't already; even a couple of dollars covers a lot of description generations.
+Get a key at [openrouter.ai/keys](https://openrouter.ai/keys) — it starts with `sk-or-`. **No credit card or purchase is required** to use the free models this app defaults to; you just need an account and a key. (If you ever switch to a paid model via the "Custom model ID" option in the sidebar, you'll need credit in your account for that.)
 
 ## 2. Push the code to GitHub
 
@@ -61,17 +61,34 @@ git push -u origin main
    `https://bazaarbhasha.streamlit.app`
 6. Open it, try generating a description, and use that URL as your **App link** in the submission form.
 
-## Why your original key was rejected
+## If you see "..." or empty descriptions
 
-The first version of this app called `api.anthropic.com` directly with an Anthropic-format API key (`sk-ant-...`). OpenRouter keys (`sk-or-...`) are a different service with a different endpoint and a different (OpenAI-compatible) request format — Anthropic's API will always reject an OpenRouter key, and vice versa. This version now calls `https://openrouter.ai/api/v1/chat/completions` with model slugs like `anthropic/claude-sonnet-5`, which is how OpenRouter expects requests to be shaped.
+This is a known failure mode on some free models: a "reasoning" model can burn its entire token budget on hidden internal thinking and have nothing left to write the real answer, or a weaker model just gets lazy and drops in a placeholder instead of writing out several similar-looking descriptions in full. The app now:
 
-## A note on cost
+- Explicitly disables hidden reasoning tokens on models that support turning it off
+- Prioritizes plain instruction-following models (Llama 3.3 70B, Gemma 3, etc.) at the top of the dropdown over "thinking" models
+- Gives the model a bigger token budget (4096) to work with
+- Detects placeholder/empty output before showing it to you, and tells you clearly which languages failed and why, instead of silently rendering "..."
 
-Because the API key is shared across every visitor once you set it as a secret, anyone who finds your public link can use your OpenRouter credits. For a hackathon demo this is usually fine (it's just for testing and evaluation), but if you're worried about it:
+If you still hit this, the fix is almost always the same: **pick a different model from the sidebar dropdown** (a plain instruct model, not a reasoning one) or generate fewer languages in one go.
 
-- The sidebar has a **"Use my own API key instead"** checkbox — visitors (including evaluators) can supply their own key if they'd rather not use yours.
-- You can also default to the cheaper **Claude Haiku 4.5** model in the sidebar to keep costs low.
-- OpenRouter lets you set a spend limit per key under **Settings → Keys** if you want a hard ceiling.
+## Why your original key was rejected, and why models were being charged
+
+Two separate issues from earlier versions, both fixed now:
+
+1. The first version called `api.anthropic.com` directly with an Anthropic-format key (`sk-ant-...`). OpenRouter keys (`sk-or-...`) are a different service with a different endpoint — Anthropic's API will always reject an OpenRouter key. This version calls `https://openrouter.ai/api/v1/chat/completions` instead, which is what OpenRouter expects.
+2. The next version defaulted to `anthropic/claude-sonnet-5` and `anthropic/claude-haiku-4.5` — real OpenRouter model slugs, but **paid** ones (Anthropic doesn't offer free Claude access through OpenRouter or anywhere else). This version instead fetches OpenRouter's current $0/token models live and defaults to one of those, so nothing gets billed unless you deliberately pick a paid model via "Custom model ID" in the sidebar.
+
+## A note on free-model quality and limits
+
+- Free models are rate-limited by OpenRouter (roughly 20 requests/minute), which is more than enough for this app's usage pattern.
+- The specific free models available rotate — a model that works today might be retired next month. If a generation fails or errors out, just pick a different model from the dropdown; the list refreshes from OpenRouter automatically (cached for an hour at a time).
+- Free open-weight models are generally a notch below Claude on following strict formatting instructions and writing natural, idiomatic text in Indian regional scripts. The app is written defensively around this (loose JSON parsing, clear system prompt), but do spot-check a few outputs before using them, especially for less common languages.
+- If you later want higher quality and don't mind paying, use the **"Custom model ID…"** option in the sidebar and enter something like `anthropic/claude-sonnet-5` — you'll just need credit in your OpenRouter account for that request.
+
+## A note on shared access
+
+Since the key lives only in this app's secrets, every visitor uses the same key — there's no way for someone to bring their own instead. For a hackathon demo this is fine (free models cost nothing regardless of who calls them), but it does mean anyone with your app's URL shares your OpenRouter rate-limit allowance.
 
 ## Notes for judges / submission form
 
@@ -81,7 +98,7 @@ Because the API key is shared across every visitor once you set it as a secret, 
 
 ## Customizing further
 
-- Languages, colors, and the prompt sent to Claude are all near the top of `app.py` — edit `LANGUAGES`, `SYSTEM_PROMPT`, or `MODELS` directly.
-- To switch models, use any OpenRouter model slug in the `MODELS` dict (browse options at [openrouter.ai/models](https://openrouter.ai/models)).
-- Want a "Copy" button instead of / alongside the WhatsApp button? `st.code()` already shows a copy icon on hover in the top-right of each code block — no extra code needed.
+- Languages, colors, and the prompt sent to the model are all near the top of `app.py` — edit `LANGUAGES`, `SYSTEM_PROMPT`, or `FALLBACK_FREE_MODELS` directly.
+- The model dropdown is generated by `fetch_free_models()`, which queries `openrouter.ai/api/v1/models` and keeps only $0/token entries. `FALLBACK_FREE_MODELS` is only used if that request fails.
+- Each result has its own "📋 Copy" button (`copy_button()` in `app.py`) that copies straight to the clipboard.
 
