@@ -161,23 +161,19 @@ with st.sidebar:
                  "anthropic/claude-sonnet-5 if your account has credit.",
         )
 
-    secret_key = st.secrets.get("OPENROUTER_API_KEY", "")
-    if secret_key:
-        st.success("Using the app's configured API key.")
-        use_own_key = st.checkbox("Use my own API key instead", value=False)
-        user_key = st.text_input("Your OpenRouter API key", type="password") if use_own_key else ""
-        api_key = user_key or secret_key
+    api_key = st.secrets.get("OPENROUTER_API_KEY", "")
+    if api_key:
+        st.success("API key loaded from secrets.")
     else:
-        st.info("No API key is configured for this app yet.")
-        api_key = st.text_input("OpenRouter API key", type="password", placeholder="sk-or-v1-...")
+        st.error(
+            "No API key configured. Add `OPENROUTER_API_KEY` to this app's secrets "
+            "(Streamlit Cloud → your app → Settings → Secrets) and it'll pick it up automatically."
+        )
 
     st.caption(
-        "Get a free key at [openrouter.ai/keys](https://openrouter.ai/keys) (starts with `sk-or-`). "
         "The model list above is fetched live and filtered to $0/token models — the lineup rotates, "
         "so if one model errors out, just try another from the list. Free models are rate-limited "
-        "(roughly 20 requests/minute), which is plenty for this app. "
-        "If you're the one deploying this app, set `OPENROUTER_API_KEY` in **Settings → Secrets** "
-        "on Streamlit Cloud so visitors don't need their own key."
+        "(roughly 20 requests/minute), which is plenty for this app."
     )
 
 # ---------------------------------------------------------------------------
@@ -345,7 +341,7 @@ def call_openrouter(api_key, model, product_name, category, price, details, lang
         except Exception:
             pass
         if response.status_code == 401:
-            raise AuthError("That API key was rejected. Double-check it in the sidebar.")
+            raise AuthError("The configured API key was rejected. Double-check the `OPENROUTER_API_KEY` value in Settings → Secrets.")
         if response.status_code == 429:
             raise RateLimitError("Rate limited by OpenRouter — wait a moment and try again.")
         raise RuntimeError(f"Request failed ({response.status_code}). {detail}")
@@ -385,7 +381,7 @@ if submitted:
     selected_langs = [LANG_BY_LABEL[label] for label in selected_labels]
 
     if not api_key:
-        st.error("Please add an OpenRouter API key in the sidebar first.")
+        st.error("This app has no API key configured yet — add `OPENROUTER_API_KEY` in Settings → Secrets.")
     elif not product_name.strip():
         st.error("Please enter a product name.")
     elif not details.strip():
