@@ -30,11 +30,16 @@ LANGUAGES = [
 ]
 LANG_BY_LABEL = {f"{l['name']} ({l['native']})": l for l in LANGUAGES}
 
-MODELS = {
-    "Claude Sonnet 5 — best quality": "anthropic/claude-sonnet-5",
-    "Claude Haiku 4.5 — faster & cheaper": "anthropic/claude-haiku-4.5",
-}
+# Free-tier OpenRouter model IDs rotate fairly often, so the real source of truth is
+# fetched live from OpenRouter's /models endpoint (see fetch_free_models below).
+# This is only a last-resort fallback if that fetch fails for some reason.
+FALLBACK_FREE_MODELS = [
+    {"id": "meta-llama/llama-3.3-70b-instruct:free", "name": "Llama 3.3 70B Instruct", "context": 131072},
+    {"id": "openai/gpt-oss-120b:free", "name": "GPT-OSS 120B", "context": 131072},
+    {"id": "google/gemma-3-27b-it:free", "name": "Gemma 3 27B", "context": 96000},
+]
 
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 CATEGORIES = [
@@ -42,6 +47,41 @@ CATEGORIES = [
     "Kids Wear", "Jewellery & Accessories", "Footwear", "Home & Kitchen",
     "Beauty & Personal Care", "Bags & Wallets", "Electronics Accessory", "Other",
 ]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_free_models():
+    """Fetch the current list of $0/token models from OpenRouter.
+
+    The free-tier lineup on OpenRouter rotates (models get added/retired often),
+    so rather than hardcoding IDs that go stale, we ask OpenRouter directly and
+    filter to models priced at zero. Falls back to a small static list if the
+    request fails for any reason (offline, OpenRouter down, etc.).
+    """
+    try:
+        resp = requests.get(OPENROUTER_MODELS_URL, timeout=15)
+        resp.raise_for_status()
+        entries = resp.json().get("data", [])
+        free = []
+        for m in entries:
+            pricing = m.get("pricing", {})
+            try:
+                prompt_price = float(pricing.get("prompt", "1") or "1")
+                completion_price = float(pricing.get("completion", "1") or "1")
+            except (TypeError, ValueError):
+                continue
+            if prompt_price == 0 and completion_price == 0:
+                free.append({
+                    "id": m.get("id"),
+                    "name": m.get("name") or m.get("id"),
+                    "context": m.get("context_length") or 0,
+                })
+        if not free:
+            return FALLBACK_FREE_MODELS
+        free.sort(key=lambda m: (-m["context"], m["name"]))
+        return free
+    except Exception:
+        return FALLBACK_FREE_MODELS
 
 # ---------------------------------------------------------------------------
 # Styling — light touch, keeps native Streamlit widgets but themes them
@@ -68,7 +108,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<span class="bb-eyebrow">✨ Built with Claude</span>', unsafe_allow_html=True)
+st.markdown('<span class="bb-eyebrow">✨ Free AI models via OpenRouter</span>', unsafe_allow_html=True)
 st.markdown('<div class="bb-title">Bazaar<span>Bhasha</span></div>', unsafe_allow_html=True)
 st.markdown(
     '<div class="bb-tagline">Describe your product once. Get ready-to-post descriptions '
@@ -82,8 +122,24 @@ st.markdown(
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    model_label = st.selectbox("Model", list(MODELS.keys()), index=0)
-    model_id = MODELS[model_label]
+
+    free_models = fetch_free_models()
+    model_options = {}
+    for m in free_models:
+        ctx_label = f" · {m['context'] // 1000}K ctx" if m["context"] else ""
+        model_options[f"{m['name']} — free{ctx_label}"] = m["id"]
+    CUSTOM_LABEL = "Custom model ID…"
+    model_options[CUSTOM_LABEL] = "__custom__"
+
+    model_choice_label = st.selectbox("Model (free tier)", list(model_options.keys()), index=0)
+    model_id = model_options[model_choice_label]
+    if model_id == "__custom__":
+        model_id = st.text_input(
+            "OpenRouter model ID",
+            value="meta-llama/llama-3.3-70b-instruct:free",
+            help="Any slug from openrouter.ai/models — including a paid one like "
+                 "anthropic/claude-sonnet-5 if your account has credit.",
+        )
 
     secret_key = st.secrets.get("OPENROUTER_API_KEY", "")
     if secret_key:
@@ -97,6 +153,9 @@ with st.sidebar:
 
     st.caption(
         "Get a free key at [openrouter.ai/keys](https://openrouter.ai/keys) (starts with `sk-or-`). "
+        "The model list above is fetched live and filtered to $0/token models — the lineup rotates, "
+        "so if one model errors out, just try another from the list. Free models are rate-limited "
+        "(roughly 20 requests/minute), which is plenty for this app. "
         "If you're the one deploying this app, set `OPENROUTER_API_KEY` in **Settings → Secrets** "
         "on Streamlit Cloud so visitors don't need their own key."
     )
@@ -210,7 +269,7 @@ def call_openrouter(api_key, model, product_name, category, price, details, lang
         },
         json={
             "model": model,
-            "max_tokens": 2000,
+            "max_tokens": 3000,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
